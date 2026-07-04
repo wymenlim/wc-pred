@@ -29,6 +29,32 @@ MAX_GOALS = 10
 ET_FACTOR = 30.0 / 90.0  # extra time = 30 minutes at the same scoring rate
 
 
+def _modal_cell(m: np.ndarray) -> tuple[tuple[int, int], float]:
+    """The single most likely (score_a, score_b) cell of a score matrix."""
+    i, j = np.unravel_index(np.argmax(m), m.shape)
+    return (int(i), int(j)), float(m[i, j])
+
+
+def modal_by_outcome(
+    m: np.ndarray,
+) -> dict[str, tuple[tuple[int, int], float]]:
+    """Most likely scoreline *within* each 1X2 outcome.
+
+    Returns {"win": ((i, j), prob), "draw": ..., "loss": ...} where "win" is
+    team_a winning. Probabilities are joint (directly comparable; with every
+    other cell they sum to 1). This keeps the reported scorelines consistent
+    with the win/draw/loss call — the global modal score can otherwise be a
+    draw even when one side is a clear favorite.
+    """
+    diag = np.zeros_like(m)
+    np.fill_diagonal(diag, np.diag(m))
+    return {
+        "win": _modal_cell(np.tril(m, -1)),
+        "draw": _modal_cell(diag),
+        "loss": _modal_cell(np.triu(m, 1)),
+    }
+
+
 def score_matrix(
     lam_a: float, lam_b: float, rho: float = 0.0, max_goals: int = MAX_GOALS
 ) -> np.ndarray:
@@ -58,6 +84,8 @@ class Prediction:
     matrix: np.ndarray
     score: tuple[int, int]
     score_prob: float
+    # most likely scoreline within each outcome: {"win"/"draw"/"loss": ((i,j), p)}
+    modal_scores: dict[str, tuple[tuple[int, int], float]]
     p_win_a: float
     p_draw: float
     p_win_b: float
@@ -65,15 +93,20 @@ class Prediction:
     p_advance_b: float | None
 
     def summary(self) -> str:
+        win = self.modal_scores["win"]
+        drw = self.modal_scores["draw"]
+        los = self.modal_scores["loss"]
         lines = [
             f"{self.team_a} vs {self.team_b}"
             + ("" if self.neutral else f" ({self.team_a} at home)"),
             f"  Expected goals:  {self.team_a} {self.lambda_a:.2f} — "
             f"{self.lambda_b:.2f} {self.team_b}",
-            f"  Most likely FT score: {self.score[0]}-{self.score[1]} "
-            f"({self.score_prob:.1%})",
             f"  Win/Draw/Win: {self.p_win_a:.1%} / {self.p_draw:.1%} / "
             f"{self.p_win_b:.1%}",
+            "  Likeliest score by outcome:",
+            f"    {self.team_a} win  {win[0][0]}-{win[0][1]} ({win[1]:.1%})",
+            f"    draw       {drw[0][0]}-{drw[0][1]} ({drw[1]:.1%})",
+            f"    {self.team_b} win  {los[0][0]}-{los[0][1]} ({los[1]:.1%})",
         ]
         if self.p_advance_a is not None:
             lines.append(
@@ -103,7 +136,8 @@ def predict(
     lam_a, lam_b = model.expected_goals(team_a, team_b, neutral)
     m = score_matrix(lam_a, lam_b, rho=model.rho, max_goals=max_goals)
 
-    i, j = np.unravel_index(np.argmax(m), m.shape)
+    (i, j), _ = _modal_cell(m)
+    modal = modal_by_outcome(m)
     p_win_a = np.tril(m, -1).sum()
     p_draw = np.trace(m)
     p_win_b = np.triu(m, 1).sum()
@@ -123,6 +157,7 @@ def predict(
         matrix=m,
         score=(int(i), int(j)),
         score_prob=float(m[i, j]),
+        modal_scores=modal,
         p_win_a=float(p_win_a),
         p_draw=float(p_draw),
         p_win_b=float(p_win_b),
@@ -148,6 +183,10 @@ def predict_fixtures(
             "xg_b": round(p.lambda_b, 2),
             "score": f"{p.score[0]}-{p.score[1]}",
             "score_prob": round(p.score_prob, 3),
+            "likeliest_by_outcome": " | ".join(
+                f"{k[0].upper()} {ij[0]}-{ij[1]} ({prob:.0%})"
+                for k, (ij, prob) in p.modal_scores.items()
+            ),
             "p_win_a": round(p.p_win_a, 3),
             "p_draw": round(p.p_draw, 3),
             "p_win_b": round(p.p_win_b, 3),
